@@ -1,0 +1,135 @@
+name: Build phone site
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: DNS-safe student site slug
+        required: true
+        type: string
+      source_owner:
+        description: Public student repository owner
+        required: true
+        type: string
+      source_repository:
+        description: Public student repository name
+        required: true
+        type: string
+      source_commit:
+        description: Exact student repository commit
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: phone-site-${{ inputs.slug }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Validate request
+        env:
+          SITE_SLUG: ${{ inputs.slug }}
+          SOURCE_OWNER: ${{ inputs.source_owner }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          node - <<'NODE'
+          const values = process.env;
+          if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(values.SITE_SLUG || "")) process.exit(1);
+          if (!/^[A-Za-z0-9_.-]{1,100}$/.test(values.SOURCE_OWNER || "")) process.exit(1);
+          if (!/^[A-Za-z0-9_.-]{1,100}$/.test(values.SOURCE_REPOSITORY || "")) process.exit(1);
+          if (!/^[a-f0-9]{40}$/i.test(values.SOURCE_COMMIT || "")) process.exit(1);
+          NODE
+
+      - name: Download exact student commit
+        env:
+          SOURCE_OWNER: ${{ inputs.source_owner }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          mkdir source
+          curl --fail --location --silent --show-error \
+            "https://github.com/${SOURCE_OWNER}/${SOURCE_REPOSITORY}/archive/${SOURCE_COMMIT}.tar.gz" \
+            --output source.tar.gz
+          tar -xzf source.tar.gz --strip-components=1 -C source
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install and export Expo web app
+        working-directory: source
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+          npx expo export -p web --output-dir dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: built-phone-site
+          path: source/dist
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: built-phone-site
+          path: ${{ runner.temp }}/built-phone-site
+
+      - name: Publish immutable build branch
+        env:
+          SITE_SLUG: ${{ inputs.slug }}
+          SOURCE_OWNER: ${{ inputs.source_owner }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          ARTIFACT_PATH: ${{ runner.temp }}/built-phone-site
+        run: |
+          BRANCH="site/${SITE_SLUG}"
+          if git show-ref --verify --quiet "refs/remotes/origin/${BRANCH}"; then
+            git checkout -B "${BRANCH}" "origin/${BRANCH}"
+          else
+            git checkout --orphan "${BRANCH}"
+          fi
+
+          git rm -rf --ignore-unmatch .
+          git clean -fdx
+          find "${ARTIFACT_PATH}" -type l -delete
+          rm -rf "${ARTIFACT_PATH}/.git" "${ARTIFACT_PATH}/.github"
+          cp -a "${ARTIFACT_PATH}/." .
+
+          node - <<'NODE'
+          const fs = require("node:fs");
+          fs.writeFileSync(".site-build.json", JSON.stringify({
+            slug: process.env.SITE_SLUG,
+            sourceOwner: process.env.SOURCE_OWNER,
+            sourceRepository: process.env.SOURCE_REPOSITORY,
+            sourceCommit: process.env.SOURCE_COMMIT.toLowerCase(),
+            builtAt: new Date().toISOString()
+          }, null, 2) + "\n");
+          NODE
+
+          git config user.name "MindDo Site Builder"
+          git config user.email "sites@minddo.ai"
+          git add -A
+          git commit -m "Build ${SITE_SLUG} at ${SOURCE_COMMIT}"
+          git push origin "HEAD:refs/heads/${BRANCH}" --force
